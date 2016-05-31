@@ -24,27 +24,33 @@ func (a *App) initStatsd() {
 	a.Cfg.AddOnChangeCallback(a.configureStatsd)
 }
 
-func (a *App) configureStatsd(cfg *Config) {
-	statsdHostport, _ := a.Cfg.Get("gop", "statsd_hostport", "localhost:8125")
+func (a *App) getStatsdPrefix() string {
 	prefix := []string{}
 	if p, ok := a.Cfg.Get("gop", "statsd_prefix", ""); ok {
 		prefix = append(prefix, p)
 	}
 	hostname := strings.Replace(a.Hostname(), ".", "_", -1)
 	prefix = append(prefix, a.ProjectName, a.AppName, hostname)
-	statsdPrefix := strings.Join(prefix, ".")
+	return strings.Join(prefix, ".")
+}
+
+func (a *App) getStatsdHostport() string {
+	statsdHostport, _ := a.Cfg.Get("gop", "statsd_hostport", "localhost:8125")
+	return statsdHostport
+}
+
+func (a *App) configureStatsd(cfg *Config) {
 	rate, _ := a.Cfg.GetFloat32("gop", "statsd_rate", 1.0)
 	recon, _ := a.Cfg.GetDuration("gop", "statsd_reconnect_every", time.Minute*1)
 	// TODO: Need to protect a.Stats from race
 	a.Stats = &StatsdClient{
 		App:        a,
 		client:     nil,
-		hostPort:   statsdHostport,
-		prefix:     statsdPrefix,
 		rate:       rate,
 		reconEvery: recon,
 	}
-	a.Infof("STATSD sending to [%s] with prefix [%s] at rate [%f]", a.Stats.hostPort, a.Stats.prefix, a.Stats.rate)
+	a.Infof("STATSD sending to [%s] with prefix [%s] at rate [%f]", a.getStatsdHostport(),
+		a.getStatsdPrefix(), a.Stats.rate)
 	a.Stats.connect()
 }
 
@@ -59,12 +65,13 @@ func (s *StatsdClient) connect() bool {
 		s.reconTimer = nil
 	}
 	var err error
-	s.client, err = statsd.New(s.hostPort, s.prefix)
+	s.client, err = statsd.New(s.getStatsdHostport(), s.getStatsdPrefix())
 	if err != nil {
 		s.Error("STATSD Failed to create client (stats will noop): " + err.Error())
 		s.client, err = statsd.NewNoopClient()
 	} else {
-		s.Finef("STATSD sending to [%s] with prefix [%s] at rate [%f]", s.hostPort, s.prefix, s.rate)
+		s.Finef("STATSD sending to [%s] with prefix [%s] at rate [%f]",
+			s.getStatsdHostport(), s.getStatsdPrefix(), s.rate)
 	}
 	if s.reconEvery != 0 {
 		s.reconTimer = time.AfterFunc(s.reconEvery, func() { s.connect() })
