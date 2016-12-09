@@ -15,6 +15,7 @@ package gop
 import (
 	"encoding/json"
 	"os"
+	"sync"
 
 	"github.com/gorilla/context"
 	"github.com/gorilla/mux"
@@ -73,10 +74,12 @@ type App struct {
 	doingGraceful            bool
 	accessLog                *os.File
 	suppressedAccessLogLines int
-	logDir                   string
 	loggerMap                map[string]int
 	logFormatterFactory      LogFormatterFactory
 	configHandlersEnabled    bool
+
+	mu     sync.RWMutex
+	logDir string
 }
 
 // The function signature your http handlers need.
@@ -655,6 +658,18 @@ func getBackTrace(showAllGoros bool) []byte {
 		bufSize *= 2
 	}
 	return buf
+}
+
+func (a *App) getLogDir() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.logDir
+}
+
+func (a *App) setLogDir(dir string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.logDir = dir
 }
 
 func (a *App) WrapHandler(h HandlerFunc, requiredParams ...string) http.HandlerFunc {
