@@ -2,11 +2,13 @@ package gop
 
 import (
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/cocoonlife/timber"
 	"github.com/vaughan0/go-ini"
 
 	"fmt"
@@ -23,9 +25,10 @@ type ConfigSource interface {
 }
 
 type Config struct {
-	source              ConfigMap
-	persistentOverrides ConfigMap
-	transientOverrides  ConfigMap
+	source              *ConfigMap
+	persistentOverrides *ConfigMap
+	transientOverrides  *ConfigMap
+	defaultSettings     *ConfigMap
 	overrideFname       string
 	onChangeCallbacks   []func(cfg *Config)
 }
@@ -106,6 +109,7 @@ func (a *App) loadAppConfigFile(requireConfig bool) {
 		source:              NewConfigMap(),
 		persistentOverrides: NewConfigMap(),
 		transientOverrides:  NewConfigMap(),
+		defaultSettings:     NewConfigMap(),
 		onChangeCallbacks:   make([]func(cfg *Config), 0),
 	}
 
@@ -308,6 +312,42 @@ func (cfg *Config) TransientOverride(sectionName, optionName, optionValue string
 	cfg.transientOverrides.mu.Unlock()
 	cfg.notifyChange()
 	return
+}
+
+func (cfg *Config) addDefaultSetting(sectionName, optionName string) {
+	v, settingExists := cfg.Get(sectionName, optionName, "")
+	if settingExists {
+		_, ok := cfg.defaultSettings.m[sectionName]
+		if !ok {
+			cfg.defaultSettings.m[sectionName] = make(map[string]string)
+		}
+		cfg.defaultSettings.m[sectionName][optionName] = v
+	}
+	// Can we do something sensible if the user added a new config
+	// option? Delete it again? Don't think the complication of
+	// using a sentinel for this is worth it given the lack of use-cases.
+}
+
+func (cfg *Config) HandleFeatureOverrides(blob io.Reader, expiryDur time.Duration) error {
+	iniCfg, err := ini.Load(blob)
+	if err != nil {
+		return err
+	}
+	for section, m := range iniCfg {
+		for k, v := range m {
+			cfg.addDefaultSetting(section, k)
+			timber.Infof("HandleFeatureOverrides: Transiently overriding %v:%v with %v", section, k, v)
+			cfg.TransientOverride(section, k, v)
+			// Go really takes the piss sometimes
+			tSection := section
+			tK := k
+			time.AfterFunc(expiryDur, func() {
+				timber.Infof("HandleFeatureOverrides: %v:%v = [%v] expired, resetting to [%v]", tSection, tK, cfg.defaultSettings.m[tSection][tK])
+				cfg.TransientOverride(tSection, tK, cfg.defaultSettings.m[tSection][tK])
+			})
+		}
+	}
+	return nil
 }
 
 func (cfg *Config) Get(sectionName, optionName string, defaultValue string) (string, bool) {
