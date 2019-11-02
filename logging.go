@@ -53,16 +53,16 @@ func (a *App) makeConfigLogger() (timber.ConfigLogger, bool) {
 
 	defaultLogDir, _ := a.Cfg.Get("gop", "log_dir", "/var/log")
 	fellbackToCWD := false
-	a.logDir = defaultLogDir + "/" + a.ProjectName
+	a.setLogDir(defaultLogDir + "/" + a.ProjectName)
 	if !forceStdout {
-		defaultLogFname := a.logDir + "/" + a.AppName + ".log"
+		defaultLogFname := a.getLogDir() + "/" + a.AppName + ".log"
 		logFname, _ := a.Cfg.Get("gop", "log_file", defaultLogFname)
 
-		_, dirExistsErr := os.Stat(a.logDir)
+		_, dirExistsErr := os.Stat(a.getLogDir())
 		if dirExistsErr != nil && os.IsNotExist(dirExistsErr) {
 			// Carry on with stdout logging, but remember to mention it
 			fellbackToCWD = true
-			a.logDir = "."
+			a.setLogDir(".")
 		} else {
 			newWriter, err := timber.NewFileWriter(logFname)
 			if err != nil {
@@ -143,7 +143,7 @@ func (a *App) configureLogging(extraTags ...string) {
 
 	doAccessLog, _ := a.Cfg.GetBool("gop", "access_log_enable", false)
 	if doAccessLog {
-		defaultAccessLogFname := a.logDir + "/" + a.AppName + "-access.log"
+		defaultAccessLogFname := a.getLogDir() + "/" + a.AppName + "-access.log"
 		accessLogFilename, _ := a.Cfg.Get("gop", "access_log_filename", defaultAccessLogFname)
 		// Don't use .Create since it truncates
 		var err error

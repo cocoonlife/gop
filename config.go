@@ -2,10 +2,13 @@ package gop
 
 import (
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"log"
+	"sync"
 	"time"
 
+	"github.com/cocoonlife/timber"
 	"github.com/vaughan0/go-ini"
 
 	"fmt"
@@ -22,17 +25,26 @@ type ConfigSource interface {
 }
 
 type Config struct {
-	source              ConfigMap
-	persistentOverrides ConfigMap
-	transientOverrides  ConfigMap
+	source              *ConfigMap
+	persistentOverrides *ConfigMap
+	transientOverrides  *ConfigMap
+	defaultSettings     *ConfigMap
 	overrideFname       string
 	onChangeCallbacks   []func(cfg *Config)
 }
 
-type ConfigMap map[string]map[string]string
+type ConfigMap struct {
+	mu sync.RWMutex
+	m  map[string]map[string]string
+}
+
+func NewConfigMap() *ConfigMap {
+	return &ConfigMap{
+		m: make(map[string]map[string]string),
+	}
+}
 
 func (a *App) getConfigFilename(forceCurrentWorkingDir bool) string {
-
 	rootEnvName := strings.ToUpper(a.ProjectName) + "_CFG_ROOT"
 	configRoot := os.Getenv(rootEnvName)
 	if configRoot == "" {
@@ -71,7 +83,9 @@ func (cm *ConfigMap) loadFromJsonFile(fname string) error {
 	if err != nil {
 		return err
 	}
-	err = json.Unmarshal(overrideJsonBytes, cm)
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	err = json.Unmarshal(overrideJsonBytes, cm.m)
 	if err != nil {
 		return err
 	}
@@ -79,7 +93,9 @@ func (cm *ConfigMap) loadFromJsonFile(fname string) error {
 }
 
 func (cm *ConfigMap) saveToJsonFile(fname string) error {
-	jsonBytes, err := json.Marshal(cm)
+	cm.mu.RLock()
+	jsonBytes, err := json.Marshal(cm.m)
+	cm.mu.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -89,19 +105,16 @@ func (cm *ConfigMap) saveToJsonFile(fname string) error {
 func (a *App) loadAppConfigFile(requireConfig bool) {
 	// We do not have logging set up yet. We just panic() on error.
 
-	// Set up a null config so we have the structure in place on early return
-	source := make(ConfigMap)
-	persistentOverrides := make(ConfigMap)
-
 	a.Cfg = Config{
-		source:              source,
-		persistentOverrides: persistentOverrides,
-		transientOverrides:  make(ConfigMap),
+		source:              NewConfigMap(),
+		persistentOverrides: NewConfigMap(),
+		transientOverrides:  NewConfigMap(),
+		defaultSettings:     NewConfigMap(),
 		onChangeCallbacks:   make([]func(cfg *Config), 0),
 	}
 
 	configFname := a.getConfigFilename(false)
-	err := source.loadFromIniFile(configFname)
+	err := a.Cfg.source.loadFromIniFile(configFname)
 	if err != nil && !os.IsNotExist(err) {
 		// Can't log, it's all too early. This is fatal, tho
 		panic(fmt.Sprintf("Can't load config file [%s]: %s", configFname, err.Error()))
@@ -110,7 +123,7 @@ func (a *App) loadAppConfigFile(requireConfig bool) {
 	if err != nil {
 		// Try again in cwd
 		configFname = a.getConfigFilename(true)
-		err = source.loadFromIniFile(configFname)
+		err = a.Cfg.source.loadFromIniFile(configFname)
 		if err != nil {
 			if os.IsNotExist(err) && !requireConfig {
 				// OK - you're allowed to not fail in this case
@@ -124,7 +137,7 @@ func (a *App) loadAppConfigFile(requireConfig bool) {
 	a.Cfg.overrideFname = configFname + ".override"
 	fi, err := os.Stat(a.Cfg.overrideFname)
 	if err == nil && fi.Size() > 0 {
-		err = persistentOverrides.loadFromJsonFile(a.Cfg.overrideFname)
+		err = a.Cfg.persistentOverrides.loadFromJsonFile(a.Cfg.overrideFname)
 		if err != nil {
 			// Don't have logging yet, so use log. and hope
 			log.Printf("Failed to load or parse override config file [%s]: %s\n", a.Cfg.overrideFname, err.Error())
@@ -138,12 +151,14 @@ func (a *App) loadAppConfigFile(requireConfig bool) {
 // Get an option value for the given sectionName.
 // Will return defaultValue if the section or the option does not exist.
 // The second return value is True if the requested option value was returned and False if the default value was returned.
-func (cfgMap *ConfigMap) Get(sectionName, optionName string, defaultValue string) (string, bool) {
-	s, ok := map[string]map[string]string(*cfgMap)[sectionName]
+func (cm *ConfigMap) Get(sectionName, optionName string, defaultValue string) (string, bool) {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	s, ok := cm.m[sectionName]
 	if !ok {
 		return defaultValue, false
 	}
-	v, ok := map[string]string(s)[optionName]
+	v, ok := s[optionName]
 	if !ok {
 		return defaultValue, false
 	}
@@ -152,18 +167,23 @@ func (cfgMap *ConfigMap) Get(sectionName, optionName string, defaultValue string
 
 // Set the given option to the specified value for the named section.
 // Create the section if it does not exist.
-func (cfgMap *ConfigMap) Add(sectionName, optionName, optionValue string) {
-	_, ok := (*cfgMap)[sectionName]
+func (cm *ConfigMap) Add(sectionName, optionName, optionValue string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	_, ok := cm.m[sectionName]
 	if !ok {
-		(*cfgMap)[sectionName] = make(map[string]string)
+		cm.m[sectionName] = make(map[string]string)
 	}
-	(*cfgMap)[sectionName][optionName] = optionValue
+	cm.m[sectionName][optionName] = optionValue
 }
 
 // Get a list of the names of the avaliable sections.
-func (cfgMap *ConfigMap) Sections() []string {
+func (cm *ConfigMap) Sections() []string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
 	sections := make([]string, 0)
-	for k := range *cfgMap {
+	for k := range cm.m {
 		sections = append(sections, k)
 	}
 	return sections
@@ -171,9 +191,11 @@ func (cfgMap *ConfigMap) Sections() []string {
 
 // Get a list of options for the named section.
 // Will return an empty list if the section does not exist.
-func (cfgMap *ConfigMap) SectionKeys(sectionName string) []string {
+func (cm *ConfigMap) SectionKeys(sectionName string) []string {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	keys := make([]string, 0)
-	section, ok := (*cfgMap)[sectionName]
+	section, ok := cm.m[sectionName]
 	if !ok {
 		return keys
 	}
@@ -206,10 +228,10 @@ func (cfg *Config) Sections() []string {
 	for _, section := range sourceSections {
 		sectionMap[section] = true
 	}
-	for section := range cfg.persistentOverrides {
+	for section := range cfg.persistentOverrides.m {
 		sectionMap[section] = true
 	}
-	for section := range cfg.transientOverrides {
+	for section := range cfg.transientOverrides.m {
 		sectionMap[section] = true
 	}
 
@@ -229,14 +251,14 @@ func (cfg *Config) SectionKeys(sectionName string) []string {
 		keyMap[key] = true
 	}
 
-	overrideSection, ok := cfg.persistentOverrides[sectionName]
+	overrideSection, ok := cfg.persistentOverrides.m[sectionName]
 	if ok {
 		for key := range overrideSection {
 			keyMap[key] = true
 		}
 	}
 
-	overrideSection, ok = cfg.transientOverrides[sectionName]
+	overrideSection, ok = cfg.transientOverrides.m[sectionName]
 	if ok {
 		for key := range overrideSection {
 			keyMap[key] = true
@@ -265,10 +287,10 @@ func (cfg *Config) AsMap() map[string]map[string]string {
 }
 
 func (cfg *Config) PersistentOverride(sectionName, optionName, optionValue string) {
-	section, ok := cfg.persistentOverrides[sectionName]
+	section, ok := cfg.persistentOverrides.m[sectionName]
 	if !ok {
-		cfg.persistentOverrides[sectionName] = make(map[string]string)
-		section = cfg.persistentOverrides[sectionName]
+		cfg.persistentOverrides.m[sectionName] = make(map[string]string)
+		section = cfg.persistentOverrides.m[sectionName]
 	}
 	section[optionName] = optionValue
 	err := cfg.savePersistentOverrides()
@@ -280,14 +302,52 @@ func (cfg *Config) PersistentOverride(sectionName, optionName, optionValue strin
 }
 
 func (cfg *Config) TransientOverride(sectionName, optionName, optionValue string) {
-	section, ok := cfg.transientOverrides[sectionName]
+	cfg.transientOverrides.mu.Lock()
+	section, ok := cfg.transientOverrides.m[sectionName]
 	if !ok {
-		cfg.transientOverrides[sectionName] = make(map[string]string)
-		section = cfg.transientOverrides[sectionName]
+		cfg.transientOverrides.m[sectionName] = make(map[string]string)
+		section = cfg.transientOverrides.m[sectionName]
 	}
 	section[optionName] = optionValue
+	cfg.transientOverrides.mu.Unlock()
 	cfg.notifyChange()
 	return
+}
+
+func (cfg *Config) addDefaultSetting(sectionName, optionName string) {
+	v, settingExists := cfg.Get(sectionName, optionName, "")
+	if settingExists {
+		_, ok := cfg.defaultSettings.m[sectionName]
+		if !ok {
+			cfg.defaultSettings.m[sectionName] = make(map[string]string)
+		}
+		cfg.defaultSettings.m[sectionName][optionName] = v
+	}
+	// Can we do something sensible if the user added a new config
+	// option? Delete it again? Don't think the complication of
+	// using a sentinel for this is worth it given the lack of use-cases.
+}
+
+func (cfg *Config) HandleFeatureOverrides(blob io.Reader, expiryDur time.Duration) error {
+	iniCfg, err := ini.Load(blob)
+	if err != nil {
+		return err
+	}
+	for section, m := range iniCfg {
+		for k, v := range m {
+			cfg.addDefaultSetting(section, k)
+			timber.Infof("HandleFeatureOverrides: Transiently overriding %v:%v with %v", section, k, v)
+			cfg.TransientOverride(section, k, v)
+			// Go really takes the piss sometimes
+			tSection := section
+			tK := k
+			time.AfterFunc(expiryDur, func() {
+				timber.Infof("HandleFeatureOverrides: %v:%v = [%v] expired, resetting to [%v]", tSection, tK, cfg.defaultSettings.m[tSection][tK])
+				cfg.TransientOverride(tSection, tK, cfg.defaultSettings.m[tSection][tK])
+			})
+		}
+	}
+	return nil
 }
 
 func (cfg *Config) Get(sectionName, optionName string, defaultValue string) (string, bool) {
